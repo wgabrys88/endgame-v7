@@ -1,0 +1,39 @@
+{
+  "type": "json_schema",
+  "json_schema": {
+    "name": "agent_action",
+    "strict": true,
+    "schema": {
+      "type": "object",
+      "properties": {
+        "observe": {
+          "type": "string",
+          "description": "What you see on screen RIGHT NOW. Mention element names, window titles, values, focus state. ONLY from SCREEN section. Min 50 words."
+        },
+        "reason": {
+          "type": "string",
+          "description": "Why this action. Reference elements, goal, next_step. If retrying, explain what failed and what's different. Min 50 words."
+        },
+        "actions": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "One or more actions to execute in sequence. Each must be: 'click <ID>', 'double_click <ID>', 'type <ID> <text>', 'press <keys>', or 'done'. Chain related actions (e.g. type then press enter). Execution stops at first failure or 'done'."
+        },
+        "expect": {
+          "type": "string",
+          "description": "What screen looks like AFTER all actions execute. Be specific and falsifiable. Min 50 words."
+        },
+        "extended_observation_needed": {
+          "type": "boolean",
+          "description": "True only if you need UI trees of windows not currently shown."
+        },
+        "developer_feedback": {
+          "type": "string",
+          "description": "Honest self-critique. What confused you? What's missing? Used to improve your prompt."
+        }
+      },
+      "required": ["observe", "reason", "actions", "expect", "extended_observation_needed", "developer_feedback"],
+      "additionalProperties": false
+    }
+  }
+}
