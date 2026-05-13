@@ -31,14 +31,39 @@ def get_model(host: str) -> str:
     return json.loads(r.stdout)["data"][0]["id"]
 
 
-def build_request(system: str, user: str, schema: dict) -> dict:
-    return {
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "response_format": schema,
-        "temperature": 0.4,
-        "top_p": 0.95,
-        "max_tokens": 4000,
+def build_request(
+    system: str,
+    user: str,
+    schema: dict,
+    **hyperparams
+) -> dict:
+    """Build request body for LM Studio with hyperparameters optimized
+    for Q6 quantized models in structured/agentic workflows
+    (planner + actor + reflector with strict JSON schemas).
+    """
+    # === Q6 QUANTIZED MODEL DEFAULTS (high reliability mode) ===
+    defaults = {
+        "temperature": 0.22,        # Very low for deterministic JSON adherence
+        "top_p": 0.92,              # Slightly tighter than 0.95
+        "top_k": 26,                # Strong limit on creativity (excellent for Q6)
+        "max_tokens": 6500,         # Generous headroom for reasoning + JSON
+        "repeat_penalty": 1.13,     # Very effective on quantized models to kill loops
+        "frequency_penalty": 0.07,  # Light penalty on repetition
+        "presence_penalty": 0.04,   # Very light
+        "seed": None,               # Set to int (e.g. 42) for reproducible runs
         "stream": False,
+    }
+
+    # Allow runtime overrides (e.g. build_request(..., temperature=0.1, top_k=20))
+    defaults.update({k: v for k, v in hyperparams.items() if v is not None})
+
+    return {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": schema,
+        **{k: v for k, v in defaults.items() if v is not None},
     }
 
 
