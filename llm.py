@@ -3,46 +3,36 @@ import json
 import os
 import pathlib
 import subprocess
-import sys
 import tempfile
 
+from log import log
+
 BASE_PATH = pathlib.Path(__file__).parent
-REQUEST_PATH = BASE_PATH / "request.txt"
-RESPONSE_PATH = BASE_PATH / "response.txt"
-
-LMS_HOSTS = ["http://localhost:1234", "http://192.168.16.31:1234"]
-
 PROMPTS_DIR = BASE_PATH / "prompts"
+LMS_HOSTS = ["http://localhost:1234", "http://192.168.16.31:1234"]
+SCHEMA_MAP = {"actor": "actor_schema.json", "planner": "planner_schema.json", "reflect": "reflect_schema.json"}
 
 
 def load_schema(role: str) -> dict:
-    """Load JSON schema from prompts/ directory. Schemas are evolvable by self-improvement."""
-    name_map = {"actor": "actor_schema.json", "planner": "planner_schema.json", "reflect": "reflect_schema.json"}
-    path = PROMPTS_DIR / name_map[role]
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads((PROMPTS_DIR / SCHEMA_MAP[role]).read_text(encoding="utf-8"))
 
 
 def find_lms_host() -> str:
     for host in LMS_HOSTS:
-        result = subprocess.run(
-            ["curl.exe", "-s", "--max-time", "3", f"{host}/v1/models"],
-            capture_output=True, timeout=50,
-        )
-        if result.returncode == 0 and result.stdout.strip():
+        r = subprocess.run(["curl.exe", "-s", "--max-time", "3", f"{host}/v1/models"],
+                           capture_output=True, timeout=50)
+        if r.returncode == 0 and r.stdout.strip():
             return host
     assert False, "no LM Studio host reachable"
 
 
 def get_model(host: str) -> str:
-    result = subprocess.run(["curl.exe", "-s", f"{host}/v1/models"], capture_output=True, timeout=100)
-    return json.loads(result.stdout)["data"][0]["id"]
+    r = subprocess.run(["curl.exe", "-s", f"{host}/v1/models"], capture_output=True, timeout=100)
+    return json.loads(r.stdout)["data"][0]["id"]
 
 
-def call_lmstudio(system: str, user: str, schema: dict) -> str:
-    host = find_lms_host()
-    model = get_model(host)
-    body = {
-        "model": model,
+def build_request(system: str, user: str, schema: dict) -> dict:
+    return {
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "response_format": schema,
         "temperature": 0.4,
@@ -50,6 +40,11 @@ def call_lmstudio(system: str, user: str, schema: dict) -> str:
         "max_tokens": 4000,
         "stream": False,
     }
+
+
+def call_lmstudio(body: dict) -> str:
+    host = find_lms_host()
+    body["model"] = get_model(host)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8")
     tmp.write(json.dumps(body))
     tmp.close()
@@ -65,32 +60,16 @@ def call_lmstudio(system: str, user: str, schema: dict) -> str:
     return json.loads(raw)["choices"][0]["message"]["content"]
 
 
-def call_acp(system: str, user: str) -> str:
+def call_acp(body: dict) -> str:
     from acp_client import prompt_once
-    text = system + "\n\n---\n\n" + user
-    return prompt_once(text, timeout=120.0)
+    return prompt_once(json.dumps(body), timeout=120.0)
 
 
-def main() -> None:
-    sys.stdout.reconfigure(encoding="utf-8")
-    backend = sys.argv[1] if len(sys.argv) > 1 else "lmstudio"
-    role = sys.argv[2] if len(sys.argv) > 2 else "actor"
-    request_text = REQUEST_PATH.read_text(encoding="utf-8")
-    parts = request_text.split("\n\nUSER:\n", 1)
-    system = parts[0].removeprefix("SYSTEM:\n")
-    user = parts[1]
+def call_backend(system: str, user: str, backend: str, role: str) -> str:
     schema = load_schema(role)
+    body = build_request(system, user, schema)
+    log(f"[{role.upper()} RAW REQUEST]\n{json.dumps(body, indent=2)}")
     match backend:
-        case "lmstudio":
-            response = call_lmstudio(system, user, schema)
-        case "acp":
-            response = call_acp(system, user)
-        case _:
-            assert False, f"unknown backend: {backend}"
-    RESPONSE_PATH.write_text(response, encoding="utf-8")
-    sys.stdout.write(response)
-    sys.stdout.write("\n")
-
-
-if __name__ == "__main__":
-    main()
+        case "lmstudio": return call_lmstudio(body)
+        case "acp": return call_acp(body)
+        case _: assert False, f"unknown backend: {backend}"
