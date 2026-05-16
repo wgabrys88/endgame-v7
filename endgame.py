@@ -9,6 +9,7 @@ import time
 
 import autonomous_self_correct
 import log as logger
+import probe_log
 from log import log, history
 from llm import set_max_request_tokens
 from prompt_sections import (
@@ -301,6 +302,7 @@ def main() -> None:
     backend = args[2] if len(args) > 2 else "lmstudio"
 
     logger.init()
+    probe_log.init()
     history("RUN_START", json.dumps({"goal": goal, "cycles": max_cycles, "backend": backend}, ensure_ascii=False))
     INTERACTION_LOG_PATH.write_text("", encoding="utf-8")
 
@@ -319,6 +321,7 @@ def main() -> None:
             time.sleep(DELAY_MANUAL_RESTORE)
 
         log(f"\n{'='*60}\nCYCLE {cycle}\n{'='*60}")
+        probe_log.log_event(f"CYCLE {cycle} START")
 
         raw_lines = phase_collect(expand_hwnds)
         planner_output = phase_planner(goal, backend, raw_lines, pending_planner_expansions,
@@ -369,6 +372,7 @@ def main() -> None:
                 break
             interaction = execute_action(action_str, book)
             interaction["cycle"] = cycle
+            probe_log.log_event(f"ACTION {action_str} → px={interaction.get('px',0)} py={interaction.get('py',0)}")
             history("ACTION", json.dumps(interaction, ensure_ascii=False))
             with open(INTERACTION_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(interaction) + "\n")
@@ -406,6 +410,7 @@ def main() -> None:
         _rotate_history()
 
     logger.close()
+    probe_log.close()
 
 
 if __name__ == "__main__":
