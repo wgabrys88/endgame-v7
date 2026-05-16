@@ -17,33 +17,33 @@
         "lessons": {
           "type": "array",
           "items": {"type": "string"},
-          "description": "Up to 5 concise TASK-AGNOSTIC lessons. Generalize specifics into reusable patterns. Bad: 'YouTube URL was wrong'. Good: 'Verify URLs match goal before hardcoding'."
+          "description": "Up to 5 concise TASK-AGNOSTIC lessons. Generalize specifics into reusable patterns."
         },
         "actor_prompt_rewrite": {
           "type": "string",
-          "description": "Full new actor system prompt. Must be same size or shorter. PRESERVE two-tier structure: generic rules + app-specific sections. NEVER delete app sections just because current goal didn't use them. Only delete if PROVEN WRONG."
+          "description": "Full new actor system prompt. PRESERVE two-tier structure: generic rules + app-specific sections. NEVER delete app sections unless PROVEN WRONG. Distill and improve."
         },
         "planner_prompt_rewrite": {
           "type": "string",
-          "description": "Full new planner system prompt. Must be same size or shorter. PRESERVE two-tier structure: generic rules + app-specific sections. NEVER delete app sections just because current goal didn't use them. Only delete if PROVEN WRONG."
+          "description": "Full new planner system prompt. PRESERVE two-tier structure: generic rules + app-specific sections. NEVER delete app sections unless PROVEN WRONG. Distill and improve."
         },
         "actor_schema_rewrite": {
           "type": "string",
-          "description": "Full new actor_schema.json content if the actor output format needs to change (add/remove/rename fields). Empty string if no change. Must be valid JSON schema."
+          "description": "Full new actor_schema.json if format needs change. Empty string if no change. Must keep 'actions' and 'expand_data' array fields."
         },
         "planner_schema_rewrite": {
           "type": "string",
-          "description": "Full new planner_schema.json content if the planner output format needs to change. Empty string if no change. Must be valid JSON schema."
+          "description": "Full new planner_schema.json if format needs change. Empty string if no change. Must keep 'expand_windows', 'expand_data', 'done_so_far', 'next_step' fields."
         },
         "patterns_that_worked": {
           "type": "array",
           "items": {"type": "string"},
-          "description": "Action patterns that succeeded. Phrase generically for reuse across tasks."
+          "description": "Action patterns that succeeded. Phrase generically for reuse."
         },
         "patterns_that_failed": {
           "type": "array",
           "items": {"type": "string"},
-          "description": "Action patterns that failed or caused loops. Phrase generically for reuse across tasks."
+          "description": "Action patterns that failed or caused loops. Phrase generically for reuse."
         }
       },
       "required": ["outcome", "cycles_used", "lessons", "actor_prompt_rewrite", "planner_prompt_rewrite", "actor_schema_rewrite", "planner_schema_rewrite", "patterns_that_worked", "patterns_that_failed"],
