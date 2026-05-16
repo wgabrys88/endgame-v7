@@ -6,21 +6,34 @@
     "schema": {
       "type": "object",
       "properties": {
-        "expand_hwnds": {
+        "expand_windows": {
           "type": "array",
-          "items": {"type": "integer"},
-          "description": "HWNDs to expand UI trees for. Focused window is auto-expanded — list ADDITIONAL ones only."
+          "items": {"type": "string"},
+          "description": "Window labels (W1, W2...) to expand UI trees for. Focused window is auto-expanded."
+        },
+        "expand_data": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "ref": {"type": "string"},
+              "range": {"type": "array", "items": {"type": "integer"}}
+            },
+            "required": ["ref", "range"],
+            "additionalProperties": false
+          },
+          "description": "Request full data. ref: 'cycle_N_typed', 'cycle_N_actor', 'clipboard', 'run_history'. range: [start_pct, end_pct] 0-100. Data arrives next cycle in EXPANDED DATA section."
         },
         "done_so_far": {
           "type": "string",
-          "description": "Factual progress from VERIFIED STATE. Mention phase (launch/interact/verify/done), what succeeded, what failed. Min 50 words."
+          "description": "Factual progress: which phases are done, what failed, what remains. Produce at least 150 tokens of analysis."
         },
         "next_step": {
           "type": "string",
-          "description": "Specific next instruction. Name keys, text to type, or element type to find (not hardcoded IDs). If stuck, diagnose and suggest different approach. Min 50 words."
+          "description": "Specific next instruction for actor. Name element types/roles to find (not IDs), text to type, or keys to press. If stuck, diagnose and suggest different approach. Produce at least 150 tokens."
         }
       },
-      "required": ["expand_hwnds", "done_so_far", "next_step"],
+      "required": ["expand_windows", "expand_data", "done_so_far", "next_step"],
       "additionalProperties": false
     }
   }
