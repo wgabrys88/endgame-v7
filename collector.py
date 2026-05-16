@@ -7,6 +7,8 @@ import time
 import uuid
 from collections import deque
 
+import probe_log
+
 BASE_PATH = pathlib.Path(__file__).parent
 INTERACTION_LOG_PATH = BASE_PATH / "interaction_log.jsonl"
 VERIFIED_STATE_PATH = BASE_PATH / "verified_state.txt"
@@ -93,7 +95,12 @@ _true_cond: ctypes.c_void_p = ctypes.c_void_p()
 def vt(this, idx, proto_args, *args):
     vtable = ctypes.cast(this, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
     proto = ctypes.WINFUNCTYPE(ctypes.HRESULT, *proto_args)
-    return proto(vtable[idx])(this, *args)
+    try:
+        return proto(vtable[idx])(this, *args)
+    except (OSError, PermissionError) as e:
+        # Return a fake failure HRESULT so upper layers can handle it gracefully
+        log(f"[COM] vtable call failed with {e}")
+        return 0x80070005  # E_ACCESSDENIED
 
 
 def release(ptr) -> None:
@@ -174,12 +181,15 @@ def get_legacy_readonly(el) -> bool:
 
 
 def element_from_point(px: int, py: int) -> ctypes.c_void_p | None:
-    pt = ctypes.c_long * 2
-    found = ctypes.c_void_p()
-    hr = vt(_uia, 7,
-            (ctypes.c_void_p, ctypes.c_long * 2, ctypes.POINTER(ctypes.c_void_p)),
-            pt(px, py), ctypes.byref(found))
-    return found if hr == 0 and found.value else None
+    try:
+        point_packed = ctypes.c_int64(px | (py << 32))
+        found = ctypes.c_void_p()
+        hr = vt(_uia, 7,
+                (ctypes.c_void_p, ctypes.c_int64, ctypes.POINTER(ctypes.c_void_p)),
+                point_packed, ctypes.byref(found))
+        return found if hr == 0 and found.value else None
+    except Exception:
+        return None
 
 
 def get_children_raw(el) -> list[ctypes.c_void_p]:
@@ -205,6 +215,51 @@ def get_children_raw(el) -> list[ctypes.c_void_p]:
 def _get_hwnd_from_element(el) -> int:
     var = _get_property(el, UIA_NATIVE_WINDOW_HANDLE)
     return int(var.val & 0xFFFFFFFF) if var.vt == 3 else 0
+
+
+# --- Tree walker and RuntimeId for hierarchy reconstruction ---
+
+_tree_walker: ctypes.c_void_p = ctypes.c_void_p()
+
+
+def _ensure_tree_walker() -> None:
+    """Create a control-view tree walker (lazy init)."""
+    global _tree_walker
+    if _tree_walker.value:
+        return
+    # IUIAutomation::get_ControlViewWalker is vtable index 14
+    vt(_uia, 14, (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+       ctypes.byref(_tree_walker))
+
+
+def get_runtime_id(el) -> tuple[int, ...] | None:
+    """Get RuntimeId as a tuple of ints for hashing/comparison."""
+    # IUIAutomationElement::GetRuntimeId is vtable index 4
+    sa_ptr = ctypes.c_void_p()
+    hr = vt(el, 4, (ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            ctypes.byref(sa_ptr))
+    if hr != 0 or not sa_ptr.value:
+        return None
+    sa = ctypes.cast(sa_ptr, ctypes.POINTER(SAFEARRAY)).contents
+    count = sa.rgsabound[0].cElements
+    if count == 0:
+        oleaut32.SafeArrayDestroy(sa_ptr)
+        return None
+    data = (ctypes.c_int * count).from_address(sa.pvData)
+    result = tuple(data[i] for i in range(count))
+    oleaut32.SafeArrayDestroy(sa_ptr)
+    return result
+
+
+def get_parent_element(el) -> ctypes.c_void_p | None:
+    """Walk up one level using the control-view tree walker."""
+    _ensure_tree_walker()
+    parent = ctypes.c_void_p()
+    # IUIAutomationTreeWalker::GetParentElement is vtable index 3
+    hr = vt(_tree_walker, 3,
+            (ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)),
+            el, ctypes.byref(parent))
+    return parent if hr == 0 and parent.value else None
 
 
 def snapshot_at(px: int, py: int) -> dict | None:
@@ -281,6 +336,9 @@ def phase_focused(out: list[str]) -> tuple[str, int]:
 
 def phase_probe(out: list[str], step: int, x0: int, y0: int, x1: int, y1: int) -> None:
     import math
+    probe_log.log_event(f"PROBE_START region=({x0},{y0})-({x1},{y1}) step={step}")
+    _ensure_tree_walker()
+    seen_rids: set[tuple[int, ...]] = set()
     amplitude = step * 0.4
     wavelength = step * 4.0
     phase_shift = math.pi * 2 / 3
@@ -293,23 +351,63 @@ def phase_probe(out: list[str], step: int, x0: int, y0: int, x1: int, y1: int) -
             user32.SetCursorPos(x, y_actual)
             time.sleep(DELAY_PROBE_DWELL)
             el = element_from_point(x, y_actual)
-            if el and el.value:
-                try:
-                    ct = get_int(el, UIA_CONTROL_TYPE)
-                    out.append(json.dumps({
-                        "probe_px": x, "probe_py": y_actual,
-                        "p_role": CONTROL_TYPE_MAP.get(ct, ""), "p_name": get_str(el, UIA_NAME),
-                        "p_aid": get_str(el, UIA_AUTOMATION_ID), "p_desc": get_str(el, UIA_DESCRIPTION),
-                        "p_x": (r := get_rect(el))[0], "p_y": r[1], "p_w": r[2], "p_h": r[3],
-                        "p_enabled": get_bool(el, UIA_IS_ENABLED),
-                        "p_focus": get_bool(el, UIA_HAS_KEYBOARD_FOCUS),
-                        "p_offscreen": get_bool(el, UIA_IS_OFFSCREEN),
-                        "p_value": get_legacy_value(el), "p_readonly": get_legacy_readonly(el),
-                    }, ensure_ascii=False))
-                except OSError:
-                    out.append(json.dumps({"probe_px": x, "probe_py": y_actual}, ensure_ascii=False))
-            else:
-                out.append(json.dumps({"probe_px": x, "probe_py": y_actual}, ensure_ascii=False))
+            if not el or not el.value:
+                continue
+            try:
+                rid = get_runtime_id(el)
+                if rid and rid in seen_rids:
+                    continue
+                if rid:
+                    seen_rids.add(rid)
+
+                ct = get_int(el, UIA_CONTROL_TYPE)
+                role = CONTROL_TYPE_MAP.get(ct, "")
+                if not role:
+                    continue
+                name = get_str(el, UIA_NAME)
+                enabled = get_bool(el, UIA_IS_ENABLED)
+                offscreen = get_bool(el, UIA_IS_OFFSCREEN)
+
+                # Walk parent chain to find containing window
+                # Use RuntimeId[1] as hwnd hint (UIA encodes process hwnd there)
+                wnd_name = ""
+                wnd_hwnd = rid[1] if rid and len(rid) >= 2 else 0
+
+                # Get window name from hwnd via window title
+                if wnd_hwnd:
+                    buf = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(W.HWND(wnd_hwnd), buf, 512)
+                    wnd_name = buf.value
+
+                # Count depth by walking up (capped for performance)
+                depth = 0
+                ancestor = el
+                for _ in range(8):
+                    parent = get_parent_element(ancestor)
+                    if not parent or not parent.value:
+                        break
+                    p_hwnd = _get_hwnd_from_element(parent)
+                    if p_hwnd:
+                        break
+                    depth += 1
+                    ancestor = parent
+
+                r = get_rect(el)
+                out.append(json.dumps({
+                    "probe_px": x, "probe_py": y_actual,
+                    "p_role": role, "p_name": name,
+                    "p_aid": get_str(el, UIA_AUTOMATION_ID), "p_desc": get_str(el, UIA_DESCRIPTION),
+                    "p_x": r[0], "p_y": r[1], "p_w": r[2], "p_h": r[3],
+                    "p_enabled": enabled,
+                    "p_focus": get_bool(el, UIA_HAS_KEYBOARD_FOCUS),
+                    "p_offscreen": offscreen,
+                    "p_value": get_legacy_value(el), "p_readonly": get_legacy_readonly(el),
+                    "p_depth": depth, "p_wnd": wnd_name, "p_hwnd": wnd_hwnd,
+                }, ensure_ascii=False))
+                probe_log.log_probe(x, y_actual, role, name, enabled, offscreen)
+            except OSError:
+                continue
+    probe_log.log_event("PROBE_END")
 
 
 def phase_windows(out: list[str], fg_title: str) -> list[tuple[ctypes.c_void_p, str, int]]:
@@ -365,12 +463,15 @@ ACTIONABLE_ROLES = frozenset({
 
 
 def phase_tree(out: list[str], target_el, wnd_name: str, wnd_hwnd: int, timeout: float) -> None:
+    probe_log.log_event(f"TREE_START wnd={wnd_name!r} hwnd={wnd_hwnd}")
     start = time.perf_counter()
     queue: deque[tuple[ctypes.c_void_p, int]] = deque()
     for child in get_children_raw(target_el):
         queue.append((child, 1))
+    count = 0
     while queue:
         if time.perf_counter() - start > timeout:
+            probe_log.log_event(f"TREE_TIMEOUT after {count} nodes")
             break
         raw_el, depth = queue.popleft()
         try:
@@ -387,17 +488,21 @@ def phase_tree(out: list[str], target_el, wnd_name: str, wnd_hwnd: int, timeout:
                 pass
             continue
         try:
+            name = get_str(raw_el, UIA_NAME)
+            enabled = get_bool(raw_el, UIA_IS_ENABLED)
             out.append(json.dumps({
                 "t_wnd": wnd_name, "t_hwnd": wnd_hwnd, "t_depth": depth,
-                "t_role": role, "t_name": get_str(raw_el, UIA_NAME),
+                "t_role": role, "t_name": name,
                 "t_aid": get_str(raw_el, UIA_AUTOMATION_ID), "t_desc": get_str(raw_el, UIA_DESCRIPTION),
                 "t_x": x, "t_y": y, "t_w": w, "t_h": h,
-                "t_enabled": get_bool(raw_el, UIA_IS_ENABLED),
+                "t_enabled": enabled,
                 "t_focus": get_bool(raw_el, UIA_HAS_KEYBOARD_FOCUS),
                 "t_value": get_legacy_value(raw_el) if role in ACTIONABLE_ROLES else "",
                 "t_readonly": get_legacy_readonly(raw_el) if role in ACTIONABLE_ROLES else False,
                 "t_offscreen": get_bool(raw_el, UIA_IS_OFFSCREEN),
             }, ensure_ascii=False))
+            count += 1
+            probe_log.log_tree(wnd_name, depth, role, name, enabled, x, y, w, h)
         except OSError:
             continue
         try:
@@ -405,6 +510,7 @@ def phase_tree(out: list[str], target_el, wnd_name: str, wnd_hwnd: int, timeout:
                 queue.append((child, depth + 1))
         except OSError:
             pass
+    probe_log.log_event(f"TREE_END nodes={count}")
 
 
 def phase_rescan_interacted() -> None:
