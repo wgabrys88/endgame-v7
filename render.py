@@ -68,7 +68,7 @@ def merge_probe_into_tree(tree_nodes: list[dict], probes: list[dict]) -> list[di
 
 
 def build_context(screen: dict, focused: dict, windows: list[dict],
-                  tree_nodes: list[dict], probes: list[dict]) -> tuple[str, list[dict]]:
+                  z_order: dict, tree_nodes: list[dict], probes: list[dict]) -> tuple[str, list[dict]]:
     book_entries: list[dict] = []
     output_lines: list[str] = []
     other_windows: list[str] = []
@@ -106,7 +106,7 @@ def build_context(screen: dict, focused: dict, windows: list[dict],
         seq += 1
         node_id = str(seq)
         book_entries.append({
-            "id": node_id, "role": role, "name": name,
+            "id": node_id, "role": role, "name": name, "value": value,
             "hwnd": node["t_hwnd"], "wnd": node["t_wnd"],
             "px": x, "py": y, "pw": w, "ph": h,
             "enabled": enabled, "readonly": readonly, "action": action_tag,
@@ -114,15 +114,27 @@ def build_context(screen: dict, focused: dict, windows: list[dict],
         tag_str = f"[{action_tag.upper()}]" if action_tag != "none" else ""
         line = f"{'  ' * (node['t_depth'] + 1)}{node_id}. {tag_str} {role}"
         line += f" '{name}'" * bool(name)
-        line += f" val='{value}'" * bool(value)
+        if value:
+            vis = value[:80] + "…" if len(value) > 80 else value
+            line += f" val='{vis}'"
         line += " disabled" * (not enabled)
         line += " *" * node["t_focus"]
         output_lines.append(line)
 
     output_lines.extend(other_windows)
+
+    # Append z-order section so LLM knows window stacking
+    z_list = z_order.get("z_order", [])
+    if z_list:
+        output_lines.append("")
+        output_lines.append("Z-ORDER (front to back):")
+        for entry in z_list[:8]:
+            marker = " [FOCUSED]" if entry["z"] == 0 else ""
+            output_lines.append(f"  z={entry['z']} hwnd={entry['hwnd']} \"{entry['title']}\"{marker}")
+
     return "\n".join(output_lines), book_entries
 
 
 def pipeline(raw_lines: list[str]) -> tuple[str, list[dict]]:
     screen, hwnds, focused, probes, windows, z_order, tree_nodes = parse_raw(raw_lines)
-    return build_context(screen, focused, windows, tree_nodes, probes)
+    return build_context(screen, focused, windows, z_order, tree_nodes, probes)
