@@ -88,10 +88,7 @@ APP-SPECIFIC: CHAT INTERFACES (Grok, ChatGPT, etc.)
 
 APP-SPECIFIC: COPY/PASTE WORKFLOWS
 - Only switch to target app AFTER verifying clipboard (unless budget critical <3 cycles).
-- Open Notepad: win+r → "notepad" → enter.
-- After Notepad opens: click document area + ctrl+v in same action array.
 - VERIFICATION: After paste, check status bar or expand_data on Document element.
-- WRONG CONTENT: Don't retry paste. Alt+tab → re-copy differently → return → 'replace'.
 
 OUTPUT one JSON object:
 - observe: what you see (key elements, titles, state)
