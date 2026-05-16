@@ -6,38 +6,37 @@ import pathlib
 import re
 import sys
 import time
-from datetime import datetime
 
 import autonomous_self_correct
 import log as logger
-from log import log
+from log import log, history
+from llm import set_max_request_tokens
 from prompt_sections import (
     load_prompt, call_llm, assemble_prompt,
-    section_goal, section_screen, section_actor_history, section_verified_state,
-    section_available_windows, section_progress, section_next_step,
-    ACTOR_HISTORY_PATH, INTERACTION_LOG_PATH, VERIFIED_STATE_PATH,
+    section_goal, section_screen, section_actor_history, section_interaction_log,
+    section_verified_state, section_available_windows, section_progress,
+    section_next_step, section_expanded_data, resolve_expansion,
+    section_developer_feedback, section_budget,
 )
 from collector import pipeline as collect_pipeline
 from render import pipeline as render_pipeline
 
 BASE_PATH = pathlib.Path(__file__).parent
-LESSONS_PATH = BASE_PATH / "lessons.txt"
-LESSONS_DIR = BASE_PATH / "lessons"
+INTERACTION_LOG_PATH = BASE_PATH / "interaction_log.jsonl"
 
-# ── Timing constants (seconds) ──
-DELAY_STARTUP = 5                # Time for user to switch to target app before agent starts
-DELAY_FOCUS = 0.3                # Wait after SetForegroundWindow for OS to process focus switch
-DELAY_CURSOR_SETTLE = 0.05       # Wait after SetCursorPos for position to register
-DELAY_MOUSE_HOLD = 0.05          # Hold duration between mouse down/up for reliable click
-DELAY_DOUBLECLICK_GAP = 0.05     # Gap between first and second click (OS double-click threshold)
-DELAY_KEY_INTER = 0.03           # Between each key down/up event for modifier ordering
-DELAY_CHAR_SEND = 0.03           # Between each character in SendInput for apps to process
-DELAY_TYPE_FOCUS = 0.3           # After clicking text field, wait for cursor/focus to appear
-DELAY_BETWEEN_ACTIONS = 0.5      # Between actions in a chain, let UI react
-DELAY_BETWEEN_CYCLES = 2.0       # Between cycles, let last action's effect fully render
-DELAY_MANUAL_RESTORE = 0.3       # After restoring focus from manual input pause
-TREE_WALK_TIMEOUT = 5.0          # Max seconds to walk a window's UI Automation tree
-PROBE_STEP_PX = 50               # Pixel grid step for probe scan across focused window
+DELAY_STARTUP = 5
+DELAY_FOCUS = 0.3
+DELAY_CURSOR_SETTLE = 0.05
+DELAY_MOUSE_HOLD = 0.05
+DELAY_DOUBLECLICK_GAP = 0.05
+DELAY_KEY_INTER = 0.03
+DELAY_CHAR_SEND = 0.03
+DELAY_TYPE_FOCUS = 0.3
+DELAY_BETWEEN_ACTIONS = 0.5
+DELAY_BETWEEN_CYCLES = 5.0
+DELAY_MANUAL_RESTORE = 0.3
+TREE_WALK_TIMEOUT = 5.0
+PROBE_STEP_PX = 50
 
 act_user32 = ctypes.WinDLL("user32", use_last_error=True)
 act_user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -52,6 +51,17 @@ VK_MAP: dict[str, int] = {
     "f1": 0x70, "f2": 0x71, "f3": 0x72, "f4": 0x73, "f5": 0x74,
     "f6": 0x75, "f7": 0x76, "f8": 0x77, "f9": 0x78, "f10": 0x79,
     "f11": 0x7A, "f12": 0x7B,
+    "`": 0xC0, "~": 0xC0,
+    "-": 0xBD, "_": 0xBD,
+    "=": 0xBB, "+": 0xBB,
+    "[": 0xDB, "{": 0xDB,
+    "]": 0xDD, "}": 0xDD,
+    "\\": 0xDC, "|": 0xDC,
+    ";": 0xBA, ":": 0xBA,
+    "'": 0xDE, '"': 0xDE,
+    ",": 0xBC, "<": 0xBC,
+    ".": 0xBE, ">": 0xBE,
+    "/": 0xBF, "?": 0xBF,
 } | {chr(ord("a") + i): ord("A") + i for i in range(26)} | {chr(ord("0") + i): ord("0") + i for i in range(10)}
 
 EXTENDED_VKS = frozenset({0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E})
@@ -123,15 +133,14 @@ def send_text(text: str) -> None:
 
 
 def resolve_selector(selector: str, book: dict[str, dict]) -> tuple[int, int, int, str, str]:
-    entry = book.get(selector)
-    assert entry, f"id not in book: {selector}"
+    entry = book[selector]
     return (entry["px"] + entry["pw"] // 2, entry["py"] + entry["ph"] // 2,
             entry["hwnd"], entry["role"], entry["name"])
 
 
 def validate_action(action_str: str, book: dict[str, dict]) -> str | None:
     verb = action_str.split()[0].rstrip(":;,")
-    rest = action_str[len(action_str.split()[0]):].strip()
+    rest = action_str[len(action_str.split()[0]):].strip().strip('"\'')
     valid_ids = set(book.keys())
     match verb:
         case "click" | "double_click":
@@ -140,10 +149,10 @@ def validate_action(action_str: str, book: dict[str, dict]) -> str | None:
                 return f"{verb} requires a numeric ID, got: {rest}"
             if node_id not in valid_ids:
                 return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
-        case "type":
+        case "type" | "replace":
             m = re.match(r"(\d+)\s+(.+)", rest)
             if not m:
-                return f"type requires 'ID text' format, got: {rest}"
+                return f"{verb} requires 'ID text' format, got: {rest}"
             if m.group(1) not in valid_ids:
                 return f"ID {m.group(1)} not in screen. Available: {sorted(valid_ids, key=int)}"
         case "press":
@@ -152,45 +161,53 @@ def validate_action(action_str: str, book: dict[str, dict]) -> str | None:
         case "done":
             return None
         case _:
-            return f"unknown action: {verb}. Valid: click, double_click, type, press, done"
+            return f"unknown action: {verb}. Valid: click, double_click, type, replace, press, done"
     return None
 
 
-def phase_act(action_str: str, book: dict[str, dict]) -> tuple[str, dict]:
+def execute_action(action_str: str, book: dict[str, dict]) -> dict:
     verb = action_str.split()[0].rstrip(":;,")
-    rest = action_str[len(action_str.split()[0]):].strip()
+    rest = action_str[len(action_str.split()[0]):].strip().strip('"\'')
     match verb:
         case "click" | "double_click":
             node_id = rest.split()[0]
             px, py, hwnd, role, name = resolve_selector(node_id, book)
             (double_click if verb == "double_click" else click)(hwnd, px, py)
-            result = f"{verb}ed {node_id} at ({px},{py})"
-            interaction = {"action": verb, "hwnd": hwnd, "px": px, "py": py,
-                           "role": role, "name": name, "element_id": node_id}
+            return {"action": verb, "element_id": node_id, "px": px, "py": py,
+                    "hwnd": hwnd, "role": role, "name": name}
         case "type":
             m = re.match(r"(\d+)\s+(.+)", rest)
-            assert m, f"no ID in type action: {rest}"
+            assert m
             node_id, text = m.group(1), m.group(2)
             px, py, hwnd, role, name = resolve_selector(node_id, book)
             click(hwnd, px, py)
             time.sleep(DELAY_TYPE_FOCUS)
             send_text(text)
-            result = f"typed '{text}' into {node_id}"
-            interaction = {"action": "type", "hwnd": hwnd, "px": px, "py": py,
-                           "role": role, "name": name, "element_id": node_id, "typed": text}
+            return {"action": "type", "element_id": node_id, "typed": text,
+                    "px": px, "py": py, "hwnd": hwnd, "role": role, "name": name}
+        case "replace":
+            m = re.match(r"(\d+)\s+(.+)", rest)
+            assert m
+            node_id, text = m.group(1), m.group(2)
+            px, py, hwnd, role, name = resolve_selector(node_id, book)
+            click(hwnd, px, py)
+            time.sleep(DELAY_TYPE_FOCUS)
+            press("ctrl+a")
+            time.sleep(DELAY_KEY_INTER)
+            send_text(text)
+            return {"action": "replace", "element_id": node_id, "typed": text,
+                    "px": px, "py": py, "hwnd": hwnd, "role": role, "name": name}
         case "press":
             keys = rest.split()[0]
             press(keys)
-            result = f"pressed {keys}"
-            interaction = {"action": "press", "keys": keys, "hwnd": 0, "px": 0, "py": 0,
-                           "role": "", "name": ""}
+            return {"action": "press", "keys": keys, "hwnd": 0, "px": 0, "py": 0,
+                    "role": "", "name": ""}
         case _:
             assert False, f"unknown verb: {verb}"
-    return result, interaction
 
 
 def phase_collect(expand_hwnds: list[int] | None) -> list[str]:
-    return collect_pipeline(TREE_WALK_TIMEOUT, PROBE_STEP_PX, False, expand_hwnds)
+    return collect_pipeline(TREE_WALK_TIMEOUT, PROBE_STEP_PX, expand_hwnds)
 
 
 def phase_render(raw_lines: list[str]) -> tuple[str, dict[str, dict]]:
@@ -198,89 +215,62 @@ def phase_render(raw_lines: list[str]) -> tuple[str, dict[str, dict]]:
     return context_text, {e["id"]: e for e in book_entries}
 
 
-def phase_planner(goal: str, backend: str, raw_lines: list[str]) -> dict:
+def phase_planner(goal: str, backend: str, raw_lines: list[str], expanded: list[str] | None = None,
+                  cycle: int = 0, max_cycles: int = 0) -> dict:
+    hwnd_map: dict[str, int] = {}
     user_prompt = assemble_prompt(
-        section_goal(goal), section_actor_history(),
-        section_verified_state(), section_available_windows(raw_lines),
+        section_goal(goal), section_budget(cycle, max_cycles),
+        section_actor_history(), section_interaction_log(),
+        section_verified_state(), section_developer_feedback(),
+        section_available_windows(raw_lines, hwnd_map),
+        section_expanded_data(expanded or []),
     )
     parsed = call_llm(load_prompt("planner_system_prompt.txt"), user_prompt, backend, "planner")
-    raw_hwnds = parsed.get("expand_hwnds") or parsed.get("windows_to_expand") or []
+
+    # Translate window labels (W1, W2...) back to HWNDs
+    raw_windows = parsed.get("expand_windows") or []
+    expand_hwnds: list[int] = []
+    for w in raw_windows:
+        w_str = str(w).strip()
+        if w_str in hwnd_map:
+            expand_hwnds.append(hwnd_map[w_str])
+        elif w_str.isdigit():
+            expand_hwnds.append(int(w_str))
+
     return {
-        "expand_hwnds": [int(h) for h in raw_hwnds if str(h).isdigit()],
-        "done_so_far": parsed.get("done_so_far") or parsed.get("reasoning") or parsed.get("progress") or "",
-        "next_step": parsed.get("next_step") or parsed.get("next") or "",
+        "expand_hwnds": expand_hwnds,
+        "expand_data": parsed.get("expand_data") or [],
+        "done_so_far": parsed.get("done_so_far") or "",
+        "next_step": parsed.get("next_step") or "",
     }
 
 
-def phase_think(goal: str, planner_output: dict, backend: str, context_text: str) -> dict:
+def phase_think(goal: str, planner_output: dict, backend: str, context_text: str,
+                expanded: list[str] | None = None, book: dict[str, dict] | None = None,
+                cycle: int = 0, max_cycles: int = 0) -> dict:
     user_prompt = assemble_prompt(
         section_screen(context_text), section_goal(goal),
+        section_budget(cycle, max_cycles),
         section_progress(planner_output), section_next_step(planner_output),
+        section_expanded_data(expanded or []),
     )
     parsed = call_llm(load_prompt("actor_system_prompt.txt"), user_prompt, backend, "actor")
-    actions = parsed.get("actions") or []
-    if not actions:
-        single = parsed.get("action") or ""
-        actions = [single] if single else []
     return {
-        "observe": parsed.get("observe") or parsed.get("observation") or "",
-        "reason": parsed.get("reason") or parsed.get("reasoning") or "",
-        "actions": actions,
-        "expect": parsed.get("expect") or parsed.get("expectation") or parsed.get("expected") or "",
+        "observe": parsed.get("observe") or "",
+        "reason": parsed.get("reason") or "",
+        "actions": parsed.get("actions") or [],
+        "expect": parsed.get("expect") or "",
         "extended_observation_needed": parsed.get("extended_observation_needed", False),
+        "expand_data": parsed.get("expand_data") or [],
         "developer_feedback": parsed.get("developer_feedback") or "",
     }
 
 
-def save_lesson(goal: str, cycle: int, actor_history: str, verified_state: str) -> None:
-    LESSONS_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = LESSONS_DIR / f"lesson_{timestamp}.json"
-    path.write_text(json.dumps({
-        "timestamp": timestamp, "goal": goal, "cycle": cycle,
-        "actor_history": actor_history, "verified_state": verified_state,
-    }, indent=2), encoding="utf-8")
-
-
-def _read_state() -> tuple[str, str]:
-    history = ACTOR_HISTORY_PATH.read_text(encoding="utf-8").strip() if ACTOR_HISTORY_PATH.exists() else ""
-    vs = VERIFIED_STATE_PATH.read_text(encoding="utf-8").strip() if VERIFIED_STATE_PATH.exists() else ""
-    return history, vs
-
-
-def _run_self_correct(goal: str, backend: str, apply: bool) -> dict:
-    return autonomous_self_correct.run(goal, backend, apply=apply)
-
-
-def evolve(args: list[str]) -> None:
-    backend = args[0] if args else "lmstudio"
-    LESSONS_DIR.mkdir(exist_ok=True)
-    lesson_files = sorted(LESSONS_DIR.glob("lesson_*.json"))
-    if not lesson_files:
-        if ACTOR_HISTORY_PATH.exists() and ACTOR_HISTORY_PATH.read_text(encoding="utf-8").strip():
-            goal = "aggregate"
-            if LESSONS_PATH.exists():
-                for line in LESSONS_PATH.read_text(encoding="utf-8").splitlines():
-                    if line.strip():
-                        goal = json.loads(line).get("goal", goal)
-            _run_self_correct(goal, backend, apply=True)
-            return
+def run_reflection(goal: str, backend: str, lessons_depth: int, do_evolve: bool) -> None:
+    if not do_evolve:
         return
-    all_histories: list[str] = []
-    goal = "aggregate"
-    for lf in lesson_files:
-        data = json.loads(lf.read_text(encoding="utf-8"))
-        goal = data.get("goal", goal)
-        if data.get("actor_history"):
-            all_histories.append(f"--- Run at cycle {data['cycle']} ---\n{data['actor_history']}")
-    ACTOR_HISTORY_PATH.write_text("\n".join(all_histories), encoding="utf-8")
-    VERIFIED_STATE_PATH.write_text(
-        json.loads(lesson_files[-1].read_text(encoding="utf-8")).get("verified_state", ""), encoding="utf-8")
-    _run_self_correct(goal, backend, apply=True)
-    archive_dir = LESSONS_DIR / "processed"
-    archive_dir.mkdir(exist_ok=True)
-    for lf in lesson_files:
-        lf.rename(archive_dir / lf.name)
+    analysis = autonomous_self_correct.reflect(goal, backend, lessons_depth)
+    autonomous_self_correct.evolve(analysis)
 
 
 def main() -> None:
@@ -288,113 +278,132 @@ def main() -> None:
     sys.stdout.reconfigure(encoding="utf-8")
 
     args = sys.argv[1:]
-    flags = {"--apply", "--evolve", "--manual"}
-    apply_flag = "--apply" in args
-    evolve_flag = "--evolve" in args
     manual = "--manual" in args
-    autonomous = False
-    reflect_every = 2
-    if "--autonomous" in args:
-        autonomous = True
-        idx = args.index("--autonomous")
-        if idx + 1 < len(args) and args[idx + 1].isdigit():
-            reflect_every = int(args[idx + 1])
-            args = args[:idx] + args[idx + 2:]
-        else:
-            args = args[:idx] + args[idx + 1:]
-    args = [a for a in args if a not in flags]
+    do_evolve = "--evolve" in args
+    reflect_every = 0
+    lessons_depth = 1
+    max_tokens = None
+    if "--req-tokens-max" in args:
+        idx = args.index("--req-tokens-max")
+        max_tokens = int(args[idx + 1])
+        args = args[:idx] + args[idx + 2:]
+    if "--reflect" in args:
+        idx = args.index("--reflect")
+        reflect_every = int(args[idx + 1])
+        lessons_depth = reflect_every
+        args = args[:idx] + args[idx + 2:]
+    args = [a for a in args if a not in ("--manual", "--evolve")]
 
-    logger.init()
-
-    if evolve_flag:
-        evolve(args)
-        logger.close()
-        return
+    set_max_request_tokens(max_tokens)
 
     goal = args[0] if len(args) > 0 else "describe what you see"
     max_cycles = int(args[1]) if len(args) > 1 else 10
     backend = args[2] if len(args) > 2 else "lmstudio"
 
+    logger.init()
+    history("RUN_START", json.dumps({"goal": goal, "cycles": max_cycles, "backend": backend}, ensure_ascii=False))
     INTERACTION_LOG_PATH.write_text("", encoding="utf-8")
-    ACTOR_HISTORY_PATH.write_text("", encoding="utf-8")
 
     expand_hwnds: list[int] | None = None
-    last_cycle = 0
-    try:
-      for cycle in range(1, max_cycles + 1):
-        last_cycle = cycle
+    pending_planner_expansions: list[str] = []
+    pending_actor_expansions: list[str] = []
+
+    for cycle in range(1, max_cycles + 1):
         if manual:
             saved_hwnd = act_user32.GetForegroundWindow()
             saved_pos = W.POINT()
             act_user32.GetCursorPos(ctypes.byref(saved_pos))
-            choice = input(f"\n[MANUAL] Cycle {cycle} — Enter=continue, r=reflect: ")
-            if choice.strip().lower() == "r":
-                _run_self_correct(goal, backend, apply=apply_flag)
-                choice = input("[MANUAL] Enter=continue, e=evolve: ")
-                if choice.strip().lower() == "e":
-                    _run_self_correct(goal, backend, apply=True)
+            input(f"\n[MANUAL] Cycle {cycle} — Enter to continue: ")
             act_user32.SetForegroundWindow(saved_hwnd)
             act_user32.SetCursorPos(saved_pos.x, saved_pos.y)
             time.sleep(DELAY_MANUAL_RESTORE)
+
         log(f"\n{'='*60}\nCYCLE {cycle}\n{'='*60}")
+
         raw_lines = phase_collect(expand_hwnds)
-        planner_output = phase_planner(goal, backend, raw_lines)
+        planner_output = phase_planner(goal, backend, raw_lines, pending_planner_expansions,
+                                       cycle, max_cycles)
+        pending_planner_expansions = []
+        history("PLANNER", json.dumps({"done_so_far": planner_output["done_so_far"], "next_step": planner_output["next_step"]}, ensure_ascii=False))
+
         planner_expand = planner_output.get("expand_hwnds", [])
         if planner_expand:
             raw_lines = phase_collect(planner_expand)
+        expand_hwnds = planner_expand or None
+
         context_text, book = phase_render(raw_lines)
-        if autonomous and cycle > 1 and cycle % reflect_every == 0:
-            if apply_flag:
-                _run_self_correct(goal, backend, apply=True)
-            else:
-                save_lesson(goal, cycle, *_read_state())
-        response = phase_think(goal, planner_output, backend, context_text)
-        if "done" in response["actions"]:
+
+        # Resolve planner's expand_data requests → inject into actor this cycle
+        planner_data_reqs = planner_output.get("expand_data") or []
+        actor_injections = list(pending_actor_expansions)
+        pending_actor_expansions = []
+        for req in planner_data_reqs:
+            ref = req.get("ref", "")
+            rng = req.get("range", [0, 100])
+            resolved = resolve_expansion(ref, rng, book)
+            log(f"[EXPAND planner] {ref} [{rng[0]}-{rng[1]}%] → {len(resolved)} chars")
+            # Planner's data requests go to planner next cycle (it asked for itself)
+            pending_planner_expansions.append(resolved)
+
+        if reflect_every and cycle > 1 and cycle % reflect_every == 0:
+            run_reflection(goal, backend, lessons_depth, do_evolve)
+
+        response = phase_think(goal, planner_output, backend, context_text, actor_injections, book,
+                               cycle, max_cycles)
+
+        if "done" in response.get("actions", []):
             response["actions"] = response["actions"][:response["actions"].index("done") + 1]
+
         chain_ok = True
-        for i, action_str in enumerate(response["actions"]):
+        for action_str in response.get("actions", []):
             if action_str == "done":
-                with open(ACTOR_HISTORY_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(response) + "\n")
+                history("ACTOR", json.dumps(response, ensure_ascii=False))
                 log("\n*** DONE ***")
                 chain_ok = False
                 break
             error = validate_action(action_str, book)
             if error:
                 response["validation_error"] = error
-                with open(ACTOR_HISTORY_PATH, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(response) + "\n")
-                if autonomous:
-                    _run_self_correct(goal, backend, apply=apply_flag)
+                history("ACTOR", json.dumps(response, ensure_ascii=False))
                 chain_ok = False
                 break
-            _, interaction = phase_act(action_str, book)
+            interaction = execute_action(action_str, book)
             interaction["cycle"] = cycle
+            history("ACTION", json.dumps(interaction, ensure_ascii=False))
             with open(INTERACTION_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(interaction) + "\n")
             time.sleep(DELAY_BETWEEN_ACTIONS)
+
+        # Resolve actor's expand_data requests AFTER actions execute
+        # (so clipboard/element reads reflect post-action state)
+        actor_data_reqs = response.get("expand_data") or []
+        for req in actor_data_reqs:
+            ref = req.get("ref", "")
+            rng = req.get("range", [0, 100])
+            resolved = resolve_expansion(ref, rng, book)
+            log(f"[EXPAND actor] {ref} [{rng[0]}-{rng[1]}%] → {len(resolved)} chars")
+            pending_actor_expansions.append(resolved)
+
         if not chain_ok and "done" in response.get("actions", []):
             break
         if not chain_ok:
-            expand_hwnds = planner_expand
             time.sleep(DELAY_BETWEEN_CYCLES)
             continue
-        with open(ACTOR_HISTORY_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(response) + "\n")
-        expand_hwnds = planner_expand if response.get("extended_observation_needed") else None
-        time.sleep(DELAY_BETWEEN_CYCLES)
-    except Exception as exc:
-        log(f"\n[CRASH] Cycle {last_cycle}: {type(exc).__name__}: {exc}")
-        history, vs = _read_state()
-        if history:
-            save_lesson(goal, last_cycle, history, vs)
-        raise
 
-    if autonomous:
-        if apply_flag:
-            _run_self_correct(goal, backend, apply=True)
-        else:
-            save_lesson(goal, max_cycles, *_read_state())
+        history("ACTOR", json.dumps(response, ensure_ascii=False))
+        if response.get("extended_observation_needed") and not planner_expand:
+            expand_hwnds = None
+        time.sleep(DELAY_BETWEEN_CYCLES)
+
+    if reflect_every:
+        run_reflection(goal, backend, lessons_depth, do_evolve)
+
+    history("RUN_END", json.dumps({"goal": goal}, ensure_ascii=False))
+
+    # Rotate history after run ends — only if evolution happened
+    if do_evolve and reflect_every:
+        from autonomous_self_correct import _rotate_history
+        _rotate_history()
 
     logger.close()
 
