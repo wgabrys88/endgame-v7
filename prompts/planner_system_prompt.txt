@@ -75,10 +75,7 @@ APP-SPECIFIC: CHAT INTERFACES (Grok, ChatGPT, etc.)
 - Only proceed to paste target AFTER clipboard verified OR budget critical.
 
 APP-SPECIFIC: COPY/PASTE TO NOTEPAD
-- PREREQUISITE: Clipboard verified (or budget critical).
-- Open: win+r → "notepad" → enter (wait 1 cycle) → click document + ctrl+v.
 - VERIFICATION: Check status bar or expand_data on Document element.
-- Once count meets threshold: instruct 'done' immediately.
 
 OUTPUT one JSON object (no markdown):
 - expand_windows: window labels to expand UI trees for
