@@ -11,8 +11,7 @@ BASE_PATH = pathlib.Path(__file__).parent
 INTERACTION_LOG_PATH = BASE_PATH / "interaction_log.jsonl"
 VERIFIED_STATE_PATH = BASE_PATH / "verified_state.txt"
 
-# ── Timing constants (seconds) ──
-DELAY_PROBE_DWELL = 0.01         # Dwell time at each probe point before querying element
+DELAY_PROBE_DWELL = 0.01
 
 ole32 = ctypes.OleDLL("ole32")
 oleaut32 = ctypes.WinDLL("oleaut32")
@@ -30,6 +29,8 @@ user32.IsWindowVisible.argtypes = [W.HWND]
 user32.IsWindowVisible.restype = W.BOOL
 user32.GetWindow.argtypes = [W.HWND, W.UINT]
 user32.GetWindow.restype = W.HWND
+user32.GetWindowRect.argtypes = [W.HWND, ctypes.POINTER(W.RECT)]
+user32.GetWindowRect.restype = W.BOOL
 
 ENUM_WINDOWS_PROC = ctypes.WINFUNCTYPE(W.BOOL, W.HWND, W.LPARAM)
 
@@ -206,12 +207,26 @@ def _get_hwnd_from_element(el) -> int:
     return int(var.val & 0xFFFFFFFF) if var.vt == 3 else 0
 
 
+def snapshot_at(px: int, py: int) -> dict | None:
+    el = element_from_point(px, py)
+    if not el or not el.value:
+        return None
+    ct = get_int(el, UIA_CONTROL_TYPE)
+    role = CONTROL_TYPE_MAP.get(ct, "")
+    name = get_str(el, UIA_NAME)
+    value = get_legacy_value(el)
+    x, y, w, h = get_rect(el)
+    return {"role": role, "name": name, "value": value, "x": x, "y": y, "w": w, "h": h}
+
+
 def phase_dpi() -> None:
     user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
 
 
 def phase_com_init() -> None:
     global _uia, _true_cond
+    if _uia.value:
+        return
     ole32.CoInitialize(None)
     ole32.CoCreateInstance(
         ctypes.byref(CLSID_CUIAutomation), None, 1,
@@ -221,7 +236,7 @@ def phase_com_init() -> None:
 
 def phase_screen(out: list[str]) -> tuple[int, int]:
     sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-    out.append(json.dumps({"sw": sw, "sh": sh}))
+    out.append(json.dumps({"sw": sw, "sh": sh}, ensure_ascii=False))
     return sw, sh
 
 
@@ -238,7 +253,7 @@ def phase_hwnds(out: list[str]) -> None:
                 "hwnd": int(child), "parent": parent_hwnd, "depth": depth,
                 "class": class_buf.value, "title": title_buf.value,
                 "visible": bool(user32.IsWindowVisible(child)),
-            }))
+            }, ensure_ascii=False))
             walk_children(int(child), depth + 1)
             child = user32.GetWindow(child, 2)
 
@@ -249,7 +264,7 @@ def phase_hwnds(out: list[str]) -> None:
             "hwnd": int(hwnd), "parent": 0, "depth": 0,
             "class": class_buf.value, "title": title_buf.value,
             "visible": bool(user32.IsWindowVisible(hwnd)),
-        }))
+        }, ensure_ascii=False))
         walk_children(int(hwnd), 1)
         return True
 
@@ -260,23 +275,29 @@ def phase_focused(out: list[str]) -> tuple[str, int]:
     hwnd = user32.GetForegroundWindow()
     buf = ctypes.create_unicode_buffer(512)
     user32.GetWindowTextW(hwnd, buf, 512)
-    out.append(json.dumps({"focused_hwnd": int(hwnd), "focused_title": buf.value}))
+    out.append(json.dumps({"focused_hwnd": int(hwnd), "focused_title": buf.value}, ensure_ascii=False))
     return buf.value, int(hwnd)
 
 
-def phase_probe(out: list[str], step: int) -> None:
-    sw = user32.GetSystemMetrics(0)
-    sh = user32.GetSystemMetrics(1)
-    for y in range(0, sh, step):
-        for x in range(0, sw, step):
-            user32.SetCursorPos(x, y)
+def phase_probe(out: list[str], step: int, x0: int, y0: int, x1: int, y1: int) -> None:
+    import math
+    amplitude = step * 0.4
+    wavelength = step * 4.0
+    phase_shift = math.pi * 2 / 3
+    for y in range(y0, y1, step):
+        row_idx = (y - y0) // step
+        x_range = range(x1 - step, x0 - 1, -step) if row_idx % 2 else range(x0, x1, step)
+        for x in x_range:
+            y_actual = y + int(amplitude * math.sin(2 * math.pi * x / wavelength + row_idx * phase_shift))
+            y_actual = max(y0, min(y1 - 1, y_actual))
+            user32.SetCursorPos(x, y_actual)
             time.sleep(DELAY_PROBE_DWELL)
-            el = element_from_point(x, y)
+            el = element_from_point(x, y_actual)
             if el and el.value:
                 try:
                     ct = get_int(el, UIA_CONTROL_TYPE)
                     out.append(json.dumps({
-                        "probe_px": x, "probe_py": y,
+                        "probe_px": x, "probe_py": y_actual,
                         "p_role": CONTROL_TYPE_MAP.get(ct, ""), "p_name": get_str(el, UIA_NAME),
                         "p_aid": get_str(el, UIA_AUTOMATION_ID), "p_desc": get_str(el, UIA_DESCRIPTION),
                         "p_x": (r := get_rect(el))[0], "p_y": r[1], "p_w": r[2], "p_h": r[3],
@@ -284,11 +305,12 @@ def phase_probe(out: list[str], step: int) -> None:
                         "p_focus": get_bool(el, UIA_HAS_KEYBOARD_FOCUS),
                         "p_offscreen": get_bool(el, UIA_IS_OFFSCREEN),
                         "p_value": get_legacy_value(el), "p_readonly": get_legacy_readonly(el),
-                    }))
+                    }, ensure_ascii=False))
                 except OSError:
-                    out.append(json.dumps({"probe_px": x, "probe_py": y}))
+                    out.append(json.dumps({"probe_px": x, "probe_py": y_actual}, ensure_ascii=False))
             else:
-                out.append(json.dumps({"probe_px": x, "probe_py": y}))
+                out.append(json.dumps({"probe_px": x, "probe_py": y_actual}, ensure_ascii=False))
+
 
 def phase_windows(out: list[str], fg_title: str) -> list[tuple[ctypes.c_void_p, str, int]]:
     root = ctypes.c_void_p()
@@ -300,7 +322,9 @@ def phase_windows(out: list[str], fg_title: str) -> list[tuple[ctypes.c_void_p, 
             x, y, w, h = get_rect(top_el)
             ct = get_int(top_el, UIA_CONTROL_TYPE)
             role = CONTROL_TYPE_MAP.get(ct, "")
-            if role != "Window" or w <= 0 or h <= 0:
+            if w <= 0 or h <= 0:
+                continue
+            if role not in ("Window", "Pane"):
                 continue
             name = get_str(top_el, UIA_NAME)
             el_hwnd = _get_hwnd_from_element(top_el)
@@ -310,7 +334,7 @@ def phase_windows(out: list[str], fg_title: str) -> list[tuple[ctypes.c_void_p, 
         out.append(json.dumps({
             "wnd_role": role, "wnd_name": name, "wnd_hwnd": el_hwnd,
             "wnd_x": x, "wnd_y": y, "wnd_w": w, "wnd_h": h, "wnd_target": is_target,
-        }))
+        }, ensure_ascii=False))
         if is_target:
             results.append((top_el, name, el_hwnd))
     return results
@@ -330,7 +354,7 @@ def phase_z_order(out: list[str]) -> None:
                 seen.add(buf.value)
                 z += 1
         hwnd = user32.GetWindow(hwnd, 2)
-    out.append(json.dumps({"z_order": z_list}))
+    out.append(json.dumps({"z_order": z_list}, ensure_ascii=False))
 
 
 ACTIONABLE_ROLES = frozenset({
@@ -373,7 +397,7 @@ def phase_tree(out: list[str], target_el, wnd_name: str, wnd_hwnd: int, timeout:
                 "t_value": get_legacy_value(raw_el) if role in ACTIONABLE_ROLES else "",
                 "t_readonly": get_legacy_readonly(raw_el) if role in ACTIONABLE_ROLES else False,
                 "t_offscreen": get_bool(raw_el, UIA_IS_OFFSCREEN),
-            }))
+            }, ensure_ascii=False))
         except OSError:
             continue
         try:
@@ -403,7 +427,7 @@ def phase_rescan_interacted() -> None:
                 "verified": True, "status": "NOT_FOUND",
                 "original_role": entry.get("role", ""), "original_name": entry.get("name", ""),
                 "px": px, "py": py, "hwnd": entry.get("hwnd", 0),
-            }))
+            }, ensure_ascii=False))
             continue
         try:
             ct = get_int(el, UIA_CONTROL_TYPE)
@@ -417,7 +441,7 @@ def phase_rescan_interacted() -> None:
                 "verified": True, "status": "NOT_FOUND",
                 "original_role": entry.get("role", ""), "original_name": entry.get("name", ""),
                 "px": px, "py": py, "hwnd": entry.get("hwnd", 0),
-            }))
+            }, ensure_ascii=False))
             continue
         orig_role, orig_name = entry.get("role", ""), entry.get("name", "")
         status = "ELEMENT_CHANGED" if (role != orig_role or (orig_name and name != orig_name)) else "OK"
@@ -433,20 +457,37 @@ def phase_rescan_interacted() -> None:
             "current_enabled": enabled,
             "current_x": rx, "current_y": ry, "current_w": rw, "current_h": rh,
             "px": px, "py": py, "hwnd": hwnd, "wnd_title": wnd_title,
-        }))
+        }, ensure_ascii=False))
     VERIFIED_STATE_PATH.write_text("\n".join(results), encoding="utf-8")
 
 
-def pipeline(timeout: float, probe_step: int, skip_probe: bool,
-             expand_hwnds: list[int] | None) -> list[str]:
+def pipeline(timeout: float, probe_step: int, expand_hwnds: list[int] | None) -> list[str]:
     out: list[str] = []
     phase_dpi()
     phase_com_init()
-    phase_screen(out)
+    sw, sh = phase_screen(out)
     phase_hwnds(out)
     fg_title, fg_hwnd = phase_focused(out)
-    if not skip_probe:
-        phase_probe(out, probe_step)
+    if expand_hwnds:
+        # Probe each expanded window's rectangle, not full screen
+        probed_rects: set[tuple[int, int, int, int]] = set()
+        for ehwnd in expand_hwnds:
+            rect = W.RECT()
+            if user32.GetWindowRect(W.HWND(ehwnd), ctypes.byref(rect)):
+                r = (rect.left, rect.top, rect.right, rect.bottom)
+                if r not in probed_rects:
+                    phase_probe(out, probe_step, *r)
+                    probed_rects.add(r)
+        # Also probe focused window if not already covered
+        rect = W.RECT()
+        user32.GetWindowRect(W.HWND(fg_hwnd), ctypes.byref(rect))
+        r = (rect.left, rect.top, rect.right, rect.bottom)
+        if r not in probed_rects:
+            phase_probe(out, probe_step, *r)
+    else:
+        rect = W.RECT()
+        user32.GetWindowRect(W.HWND(fg_hwnd), ctypes.byref(rect))
+        phase_probe(out, probe_step, rect.left, rect.top, rect.right, rect.bottom)
     phase_rescan_interacted()
     targets = phase_windows(out, fg_title)
     phase_z_order(out)
@@ -470,6 +511,3 @@ def pipeline(timeout: float, probe_step: int, skip_probe: bool,
                 phase_tree(out, top_el, name, el_hwnd, timeout)
                 walked_hwnds.add(el_hwnd)
     return out
-
-
-
