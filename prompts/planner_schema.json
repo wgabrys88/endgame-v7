@@ -22,15 +22,15 @@
             "required": ["ref", "range"],
             "additionalProperties": false
           },
-          "description": "Request full data. ref: 'cycle_N_typed', 'cycle_N_actor', 'clipboard', 'run_history'. range: [start_pct, end_pct] 0-100. Data arrives next cycle in EXPANDED DATA section."
+          "description": "Request full data. ref: 'cycle_N_typed', 'cycle_N_actor', 'clipboard', 'run_history'. range: [start_pct, end_pct] 0-100."
         },
         "done_so_far": {
           "type": "string",
-          "description": "Factual progress: which phases are done, what failed, what remains. Produce at least 150 tokens of analysis."
+          "description": "Factual progress: phases done, what failed, what remains. Produce at least 50 tokens."
         },
         "next_step": {
           "type": "string",
-          "description": "Specific next instruction for actor. Name element types/roles to find (not IDs), text to type, or keys to press. If stuck, diagnose and suggest different approach. Produce at least 150 tokens."
+          "description": "Specific instruction for actor. Name element roles/names to find. Instruct chaining 3-5 actions. If stuck, mandate different approach. Produce at least 50 tokens."
         }
       },
       "required": ["expand_windows", "expand_data", "done_so_far", "next_step"],
