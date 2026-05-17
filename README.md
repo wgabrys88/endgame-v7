@@ -26,7 +26,7 @@ Real execution traces. Left = **LM Studio** (local model on consumer hardware). 
 | **LM Studio Run** (Local • gemma-4-E4B Q6) | **ACP Run** (Multi-app • Vague goal) |
 |---------------------------------------------|--------------------------------------|
 | **Created `hello_world.py` in VS Code, saved it, and clicked "Run Python File"** — 4 evolution cycles on GTX 1060 6GB. | **Completed complex multi-app task** (YouTube + mute + Opera + Grok + copy to Notepad) after evolution fixed the patterns. |
-| [![LM Studio Demo](thumbnail-lmstudio.jpg)](https://github.com/user-attachments/assets/ef4b72d8-bd78-444c-b9fb-d69e0eb30bf4) | [![ACP Demo](thumbnail-acp.jpg)](https://github.com/user-attachments/assets/6314f179-8abe-4d10-9be9-0df2f96228cc) |
+| [![LM Studio Demo](assets/thumbnail-lmstudio.jpg)](https://github.com/user-attachments/assets/ef4b72d8-bd78-444c-b9fb-d69e0eb30bf4) | [![ACP Demo](assets/thumbnail-acp.jpg)](https://github.com/user-attachments/assets/6314f179-8abe-4d10-9be9-0df2f96228cc) |
 
 ---
 
