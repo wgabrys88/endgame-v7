@@ -4,7 +4,7 @@ import pathlib
 import re
 
 from llm import call_backend
-from log import log, pretty, read_current_run, read_last_n
+from log import log, log_file, pretty, read_current_run, read_last_n, read_since_last_lesson
 
 BASE_PATH = pathlib.Path(__file__).parent
 PROMPTS_DIR = BASE_PATH / "prompts"
@@ -21,7 +21,9 @@ def call_llm(system: str, user: str, backend: str, role: str, retries: int = 2) 
     for attempt in range(1, retries + 2):
         raw = call_backend(system, user, backend, role)
         tokens_est = len(raw) // 4
-        log(f"[{role.upper()} RAW RESPONSE ~{tokens_est}tok]\n{pretty(raw)}")
+        log(f"[{role.upper()} RESPONSE ~{tokens_est}tok]")
+        log(pretty(raw))
+        log_file(raw)
         try:
             return _extract_json(raw, role)
         except (AssertionError, json.JSONDecodeError) as e:
@@ -173,29 +175,30 @@ def _get_cycle_actor(cycle_num: int) -> str:
 
 
 def _get_clipboard() -> str:
-    """Read clipboard text via ctypes (Windows only)."""
-    try:
-        import ctypes
-        u32 = ctypes.windll.user32
-        k32 = ctypes.windll.kernel32
-        CF_UNICODETEXT = 13
-        if not u32.OpenClipboard(0):
-            return "[clipboard: could not open]"
-        try:
-            handle = u32.GetClipboardData(CF_UNICODETEXT)
-            if not handle:
-                return "[clipboard: empty or non-text]"
-            ptr = k32.GlobalLock(handle)
-            if not ptr:
-                return "[clipboard: lock failed]"
-            try:
-                return ctypes.wstring_at(ptr)
-            finally:
-                k32.GlobalUnlock(handle)
-        finally:
-            u32.CloseClipboard()
-    except Exception as e:
-        return f"[clipboard error: {e}]"
+    import ctypes
+    u32 = ctypes.windll.user32
+    k32 = ctypes.windll.kernel32
+    k32.GlobalLock.argtypes = [ctypes.c_void_p]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    k32.GlobalSize.argtypes = [ctypes.c_void_p]
+    k32.GlobalSize.restype = ctypes.c_size_t
+    u32.GetClipboardData.argtypes = [ctypes.c_uint]
+    u32.GetClipboardData.restype = ctypes.c_void_p
+    if not u32.OpenClipboard(0):
+        return "[clipboard: could not open]"
+    handle = u32.GetClipboardData(13)
+    if not handle:
+        u32.CloseClipboard()
+        return "[clipboard: empty]"
+    ptr = k32.GlobalLock(handle)
+    if not ptr:
+        u32.CloseClipboard()
+        return "[clipboard: lock failed]"
+    text = ctypes.c_wchar_p(ptr).value or ""
+    k32.GlobalUnlock(handle)
+    u32.CloseClipboard()
+    return text
 
 
 def _get_run_history() -> str:
@@ -273,22 +276,7 @@ def section_actor_history() -> str:
     return "HISTORY:\n" + "\n".join(lines[-8:]) if lines else ""
 
 
-def section_interaction_log() -> str:
-    """Natural language recent actions — no element IDs, no HWNDs."""
-    entries = read_current_run("ACTION")
-    if not entries:
-        return ""
-    descs: list[str] = []
-    for raw in entries[-8:]:
-        try:
-            descs.append(_describe_action(json.loads(raw)))
-        except (json.JSONDecodeError, AttributeError):
-            pass
-    return "RECENT ACTIONS:\n" + "\n".join(f"  - {d}" for d in descs) if descs else ""
-
-
 def section_developer_feedback() -> str:
-    """Last 4 actor self-critiques — valuable for planner to detect issues."""
     entries = read_current_run("ACTOR")
     if not entries:
         return ""
@@ -337,24 +325,37 @@ def section_verified_state() -> str:
 
 
 def section_available_windows(raw_lines: list[str], hwnd_map: dict | None = None) -> str:
-    """Present windows as W1, W2... Populate hwnd_map for reverse lookup."""
     windows: list[tuple[int, str]] = []
     seen_hwnds: set[int] = set()
+    z_order: dict[int, int] = {}
+    uia_hwnds: set[int] = set()
     for line in raw_lines:
         try:
             obj = json.loads(line)
         except (json.JSONDecodeError, AttributeError):
             continue
-        if "hwnd" in obj and obj.get("depth") == 0 and obj.get("visible") and (obj.get("title") or obj.get("class")):
-            hwnd = obj["hwnd"]
+        if "z_order" in obj:
+            for entry in obj["z_order"]:
+                z_order[entry["hwnd"]] = entry["z"]
+        if "wnd_name" in obj and obj.get("wnd_hwnd") and obj.get("wnd_name"):
+            hwnd = obj["wnd_hwnd"]
+            uia_hwnds.add(hwnd)
             if hwnd not in seen_hwnds:
-                windows.append((hwnd, obj.get("title") or obj.get("class")))
+                windows.append((hwnd, obj["wnd_name"]))
                 seen_hwnds.add(hwnd)
-        if "wnd_name" in obj and obj.get("wnd_hwnd") and obj["wnd_hwnd"] not in seen_hwnds and obj.get("wnd_name"):
-            windows.append((obj["wnd_hwnd"], obj["wnd_name"]))
-            seen_hwnds.add(obj["wnd_hwnd"])
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, AttributeError):
+            continue
+        if "hwnd" in obj and obj.get("depth") == 0 and obj.get("visible") and obj.get("title"):
+            hwnd = obj["hwnd"]
+            if hwnd not in seen_hwnds and hwnd in z_order:
+                windows.append((hwnd, obj["title"]))
+                seen_hwnds.add(hwnd)
     if not windows:
         return ""
+    windows.sort(key=lambda w: z_order.get(w[0], 999))
     lines: list[str] = []
     for i, (hwnd, title) in enumerate(windows, 1):
         label = f"W{i}"
@@ -415,10 +416,10 @@ def section_run_outcome() -> str:
 
 
 def section_full_run_log() -> str:
-    """Full uncompressed run log for the reflector — all planner, actor, and action entries."""
-    planner_entries = read_current_run("PLANNER")
-    actor_entries = read_current_run("ACTOR")
-    action_entries = read_current_run("ACTION")
+    """Run log for the reflector — only entries since last LESSON boundary."""
+    planner_entries = read_since_last_lesson("PLANNER")
+    actor_entries = read_since_last_lesson("ACTOR")
+    action_entries = read_since_last_lesson("ACTION")
     if not actor_entries and not action_entries:
         return ""
     lines: list[str] = []
