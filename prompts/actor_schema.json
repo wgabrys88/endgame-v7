@@ -8,24 +8,24 @@
       "properties": {
         "observe": {
           "type": "string",
-          "description": "What you see on screen RIGHT NOW. Key elements, window titles, values, focus state. Produce at least 150 tokens."
+          "description": "What you see: focused window, key element IDs, current state. 50+ tokens."
         },
         "reason": {
           "type": "string",
-          "description": "Why this action. Reference goal, next_step, and relevant elements. If retrying, explain what's different. Produce at least 150 tokens."
+          "description": "Why you chose these actions. Reference the planner's instruction. 50+ tokens."
         },
         "actions": {
           "type": "array",
           "items": {"type": "string"},
-          "description": "Actions to execute in sequence: 'click <ID>', 'double_click <ID>', 'type <ID> <text>', 'replace <ID> <text>', 'press <keys>', or 'done'. Chain deterministic sequences. Execution stops at first failure or 'done'."
+          "description": "Actions: click <ID>, double_click <ID>, type <ID> <text>, replace <ID> <text>, press <ID> <keys>, scroll_down <ID>, scroll_up <ID>, hover <ID>, done."
         },
         "expect": {
           "type": "string",
-          "description": "Predicted screen state after execution. Be specific and falsifiable."
+          "description": "What you expect to see after these actions execute. 50+ tokens."
         },
         "extended_observation_needed": {
           "type": "boolean",
-          "description": "True only if you need UI trees of windows not currently shown."
+          "description": "True if you need UI trees of additional windows expanded next cycle."
         },
         "expand_data": {
           "type": "array",
@@ -38,11 +38,11 @@
             "required": ["ref", "range"],
             "additionalProperties": false
           },
-          "description": "Request full data for next cycle. ref: 'cycle_N_typed', 'element_ID_value', 'clipboard', 'run_history'. range: [start_pct, end_pct] 0-100. Data arrives next cycle in EXPANDED DATA section."
+          "description": "Data to fetch for next cycle. Refs: clipboard, cycle_N_typed, run_history."
         },
         "developer_feedback": {
           "type": "string",
-          "description": "Honest self-critique: what could go wrong, what's uncertain, what loops are you detecting. Produce at least 150 tokens."
+          "description": "Risks, loops detected, alternative approaches if this fails. 50+ tokens."
         }
       },
       "required": ["observe", "reason", "actions", "expect", "extended_observation_needed", "expand_data", "developer_feedback"],
