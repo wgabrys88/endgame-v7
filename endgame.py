@@ -9,18 +9,21 @@ import time
 
 import autonomous_self_correct
 import log as logger
-import probe_log
 from log import log, history
 from llm import set_max_request_tokens
 from prompt_sections import (
     load_prompt, call_llm, assemble_prompt,
-    section_goal, section_screen, section_actor_history, section_interaction_log,
+    section_goal, section_screen, section_actor_history,
     section_verified_state, section_available_windows, section_progress,
     section_next_step, section_expanded_data, resolve_expansion,
     section_developer_feedback, section_budget,
 )
 from collector import pipeline as collect_pipeline
-from render import pipeline as render_pipeline
+from collector import (
+    element_from_point, get_int, get_bool, get_str, get_legacy_readonly,
+    phase_com_init, UIA_CONTROL_TYPE, UIA_IS_ENABLED, UIA_NAME, CONTROL_TYPE_MAP,
+)
+from render import pipeline as render_pipeline, WRITABLE_ROLES
 
 BASE_PATH = pathlib.Path(__file__).parent
 INTERACTION_LOG_PATH = BASE_PATH / "interaction_log.jsonl"
@@ -44,8 +47,10 @@ act_user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
 
 VK_MAP: dict[str, int] = {
     "enter": 0x0D, "return": 0x0D, "tab": 0x09, "escape": 0x1B, "esc": 0x1B,
-    "backspace": 0x08, "delete": 0x2E, "insert": 0x2D,
-    "home": 0x24, "end": 0x23, "pageup": 0x21, "pagedown": 0x22,
+    "backspace": 0x08, "delete": 0x2E, "del": 0x2E, "insert": 0x2D, "ins": 0x2D,
+    "home": 0x24, "end": 0x23,
+    "pageup": 0x21, "page_up": 0x21, "pgup": 0x21,
+    "pagedown": 0x22, "page_down": 0x22, "pgdn": 0x22,
     "up": 0x26, "down": 0x28, "left": 0x25, "right": 0x27,
     "ctrl": 0x11, "control": 0x11, "alt": 0x12, "shift": 0x10,
     "win": 0x5B, "windows": 0x5B, "meta": 0x5B, "super": 0x5B, "space": 0x20,
@@ -98,8 +103,16 @@ def double_click(hwnd: int, px: int, py: int) -> None:
     act_user32.mouse_event(0x0004, 0, 0, 0, 0)
 
 
+def scroll(hwnd: int, px: int, py: int, clicks: int) -> None:
+    act_user32.SetForegroundWindow(hwnd)
+    time.sleep(DELAY_FOCUS)
+    act_user32.SetCursorPos(px, py)
+    time.sleep(DELAY_CURSOR_SETTLE)
+    act_user32.mouse_event(0x0800, 0, 0, clicks * 120, 0)
+
+
 def resolve_vk(name: str) -> int:
-    vk = VK_MAP.get(name)
+    vk = VK_MAP.get(name.lower())
     if vk is not None:
         return vk
     assert len(name) == 1, f"unknown key: {name}"
@@ -139,36 +152,81 @@ def resolve_selector(selector: str, book: dict[str, dict]) -> tuple[int, int, in
             entry["hwnd"], entry["role"], entry["name"])
 
 
+def move_and_probe(px: int, py: int) -> dict:
+    act_user32.SetCursorPos(px, py)
+    time.sleep(DELAY_CURSOR_SETTLE)
+    el = element_from_point(px, py)
+    if not el or not el.value:
+        return {"role": "", "name": "", "enabled": False, "readonly": False}
+    ct = get_int(el, UIA_CONTROL_TYPE)
+    role = CONTROL_TYPE_MAP.get(ct, "")
+    name = get_str(el, UIA_NAME) if el else ""
+    enabled = get_bool(el, UIA_IS_ENABLED)
+    readonly = get_legacy_readonly(el) if role in WRITABLE_ROLES else False
+    return {"role": role, "name": name, "enabled": enabled, "readonly": readonly}
+
+
 def validate_action(action_str: str, book: dict[str, dict]) -> str | None:
-    verb = action_str.split()[0].rstrip(":;,")
-    rest = action_str[len(action_str.split()[0]):].strip().strip('"\'')
+    parts = action_str.split(None, 1)
+    verb = parts[0].rstrip(":;,")
+    rest = parts[1].strip().strip('"\'') if len(parts) > 1 else ""
     valid_ids = set(book.keys())
-    match verb:
-        case "click" | "double_click":
-            node_id = rest.split()[0]
-            if not node_id.isdigit():
-                return f"{verb} requires a numeric ID, got: {rest}"
-            if node_id not in valid_ids:
-                return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
-        case "type" | "replace":
-            m = re.match(r"(\d+)\s+(.+)", rest)
-            if not m:
-                return f"{verb} requires 'ID text' format, got: {rest}"
-            if m.group(1) not in valid_ids:
-                return f"ID {m.group(1)} not in screen. Available: {sorted(valid_ids, key=int)}"
-        case "press":
-            if not rest:
-                return "press requires key name(s)"
-        case "done":
-            return None
-        case _:
-            return f"unknown action: {verb}. Valid: click, double_click, type, replace, press, done"
-    return None
+    if verb == "done":
+        return None
+    if verb in ("click", "double_click", "hover"):
+        node_id = rest.split()[0] if rest else ""
+        if not node_id.isdigit() or node_id not in valid_ids:
+            return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
+        px, py, hwnd, role, name = resolve_selector(node_id, book)
+        probe = move_and_probe(px, py)
+        log(f"[PROBE] {verb} {node_id} at ({px},{py}) -> {probe['role']} enabled={probe['enabled']}")
+        if not probe["enabled"]:
+            return f"Element {node_id} ({role} '{name}') is disabled"
+        return None
+    if verb in ("scroll_down", "scroll_up"):
+        node_id = rest.split()[0] if rest else ""
+        if not node_id.isdigit() or node_id not in valid_ids:
+            return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
+        return None
+    if verb in ("type", "replace"):
+        m = re.match(r"(\d+)\s+(.+)", rest)
+        if not m:
+            return f"{verb} requires 'ID text' format"
+        node_id = m.group(1)
+        if node_id not in valid_ids:
+            return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
+        px, py, hwnd, role, name = resolve_selector(node_id, book)
+        probe = move_and_probe(px, py)
+        log(f"[PROBE] {verb} {node_id} at ({px},{py}) -> {probe['role']} enabled={probe['enabled']} readonly={probe['readonly']}")
+        if not probe["enabled"]:
+            return f"Element {node_id} ({role} '{name}') is disabled"
+        if probe["readonly"]:
+            return f"Element {node_id} is readonly"
+        return None
+    if verb == "press":
+        m = re.match(r"(\d+)\s+(.+)", rest)
+        if not m:
+            return f"press requires 'ID keys' format"
+        node_id, keys_str = m.group(1), m.group(2)
+        if node_id not in valid_ids:
+            return f"ID {node_id} not in screen. Available: {sorted(valid_ids, key=int)}"
+        key_parts = [p.strip().lower() for p in keys_str.replace(",", "+").split("+") if p.strip()]
+        for p in key_parts:
+            if p not in VK_MAP:
+                return f"Unknown key '{p}'. Valid: enter, tab, escape, ctrl, alt, shift, win, space, home, end, pagedown, page_down, pageup, page_up, delete, backspace, up, down, left, right, f1-f12, a-z, 0-9"
+        px, py, hwnd, role, name = resolve_selector(node_id, book)
+        probe = move_and_probe(px, py)
+        log(f"[PROBE] press {node_id} at ({px},{py}) -> {probe['role']} enabled={probe['enabled']}")
+        if not probe["enabled"]:
+            return f"Element {node_id} ({role} '{name}') is disabled"
+        return None
+    return f"Unknown action: {verb}. Valid: click, double_click, type, replace, press, scroll_down, scroll_up, hover, done"
 
 
 def execute_action(action_str: str, book: dict[str, dict]) -> dict:
-    verb = action_str.split()[0].rstrip(":;,")
-    rest = action_str[len(action_str.split()[0]):].strip().strip('"\'')
+    parts = action_str.split(None, 1)
+    verb = parts[0].rstrip(":;,")
+    rest = parts[1].strip().strip('"\'') if len(parts) > 1 else ""
     match verb:
         case "click" | "double_click":
             node_id = rest.split()[0]
@@ -176,9 +234,22 @@ def execute_action(action_str: str, book: dict[str, dict]) -> dict:
             (double_click if verb == "double_click" else click)(hwnd, px, py)
             return {"action": verb, "element_id": node_id, "px": px, "py": py,
                     "hwnd": hwnd, "role": role, "name": name}
+        case "hover":
+            node_id = rest.split()[0]
+            px, py, hwnd, role, name = resolve_selector(node_id, book)
+            probe = move_and_probe(px, py)
+            return {"action": "hover", "element_id": node_id, "px": px, "py": py,
+                    "hwnd": hwnd, "role": role, "name": name,
+                    "probe_role": probe["role"], "probe_name": probe["name"]}
+        case "scroll_down" | "scroll_up":
+            node_id = rest.split()[0]
+            px, py, hwnd, role, name = resolve_selector(node_id, book)
+            clicks = -3 if verb == "scroll_down" else 3
+            scroll(hwnd, px, py, clicks)
+            return {"action": verb, "element_id": node_id, "px": px, "py": py,
+                    "hwnd": hwnd, "role": role, "name": name}
         case "type":
             m = re.match(r"(\d+)\s+(.+)", rest)
-            assert m
             node_id, text = m.group(1), m.group(2)
             px, py, hwnd, role, name = resolve_selector(node_id, book)
             click(hwnd, px, py)
@@ -188,7 +259,6 @@ def execute_action(action_str: str, book: dict[str, dict]) -> dict:
                     "px": px, "py": py, "hwnd": hwnd, "role": role, "name": name}
         case "replace":
             m = re.match(r"(\d+)\s+(.+)", rest)
-            assert m
             node_id, text = m.group(1), m.group(2)
             px, py, hwnd, role, name = resolve_selector(node_id, book)
             click(hwnd, px, py)
@@ -199,12 +269,14 @@ def execute_action(action_str: str, book: dict[str, dict]) -> dict:
             return {"action": "replace", "element_id": node_id, "typed": text,
                     "px": px, "py": py, "hwnd": hwnd, "role": role, "name": name}
         case "press":
-            keys = rest.split()[0]
+            m = re.match(r"(\d+)\s+(.+)", rest)
+            node_id, keys = m.group(1), m.group(2)
+            px, py, hwnd, role, name = resolve_selector(node_id, book)
+            click(hwnd, px, py)
+            time.sleep(DELAY_FOCUS)
             press(keys)
-            return {"action": "press", "keys": keys, "hwnd": 0, "px": 0, "py": 0,
-                    "role": "", "name": ""}
-        case _:
-            assert False, f"unknown verb: {verb}"
+            return {"action": "press", "element_id": node_id, "keys": keys,
+                    "px": px, "py": py, "hwnd": hwnd, "role": role, "name": name}
 
 
 def phase_collect(expand_hwnds: list[int] | None) -> list[str]:
@@ -221,7 +293,7 @@ def phase_planner(goal: str, backend: str, raw_lines: list[str], expanded: list[
     hwnd_map: dict[str, int] = {}
     user_prompt = assemble_prompt(
         section_goal(goal), section_budget(cycle, max_cycles),
-        section_actor_history(), section_interaction_log(),
+        section_actor_history(),
         section_verified_state(), section_developer_feedback(),
         section_available_windows(raw_lines, hwnd_map),
         section_expanded_data(expanded or []),
@@ -274,7 +346,20 @@ def run_reflection(goal: str, backend: str, lessons_depth: int, do_evolve: bool)
     autonomous_self_correct.evolve(analysis)
 
 
+_interrupted = False
+
+
+def _handle_sigint(sig, frame):
+    global _interrupted
+    if _interrupted:
+        sys.exit(1)
+    _interrupted = True
+    log("\n[INTERRUPTED] Ctrl+C received. Finishing current cycle then evolving...")
+
+
 def main() -> None:
+    import signal
+    signal.signal(signal.SIGINT, _handle_sigint)
     time.sleep(DELAY_STARTUP)
     sys.stdout.reconfigure(encoding="utf-8")
 
@@ -302,7 +387,6 @@ def main() -> None:
     backend = args[2] if len(args) > 2 else "lmstudio"
 
     logger.init()
-    probe_log.init()
     history("RUN_START", json.dumps({"goal": goal, "cycles": max_cycles, "backend": backend}, ensure_ascii=False))
     INTERACTION_LOG_PATH.write_text("", encoding="utf-8")
 
@@ -311,6 +395,9 @@ def main() -> None:
     pending_actor_expansions: list[str] = []
 
     for cycle in range(1, max_cycles + 1):
+        if _interrupted:
+            log(f"[INTERRUPTED] Breaking at cycle {cycle}")
+            break
         if manual:
             saved_hwnd = act_user32.GetForegroundWindow()
             saved_pos = W.POINT()
@@ -321,7 +408,6 @@ def main() -> None:
             time.sleep(DELAY_MANUAL_RESTORE)
 
         log(f"\n{'='*60}\nCYCLE {cycle}\n{'='*60}")
-        probe_log.log_event(f"CYCLE {cycle} START")
 
         raw_lines = phase_collect(expand_hwnds)
         planner_output = phase_planner(goal, backend, raw_lines, pending_planner_expansions,
@@ -336,7 +422,7 @@ def main() -> None:
 
         context_text, book = phase_render(raw_lines)
 
-        # Resolve planner's expand_data requests → inject into actor this cycle
+        # Resolve planner's expand_data requests -> inject into actor this cycle
         planner_data_reqs = planner_output.get("expand_data") or []
         actor_injections = list(pending_actor_expansions)
         pending_actor_expansions = []
@@ -344,7 +430,7 @@ def main() -> None:
             ref = req.get("ref", "")
             rng = req.get("range", [0, 100])
             resolved = resolve_expansion(ref, rng, book)
-            log(f"[EXPAND planner] {ref} [{rng[0]}-{rng[1]}%] → {len(resolved)} chars")
+            log(f"[EXPAND planner] {ref} [{rng[0]}-{rng[1]}%] -> {len(resolved)} chars")
             # Planner's data requests go to planner next cycle (it asked for itself)
             pending_planner_expansions.append(resolved)
 
@@ -372,7 +458,6 @@ def main() -> None:
                 break
             interaction = execute_action(action_str, book)
             interaction["cycle"] = cycle
-            probe_log.log_event(f"ACTION {action_str} → px={interaction.get('px',0)} py={interaction.get('py',0)}")
             history("ACTION", json.dumps(interaction, ensure_ascii=False))
             with open(INTERACTION_LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(json.dumps(interaction) + "\n")
@@ -385,7 +470,7 @@ def main() -> None:
             ref = req.get("ref", "")
             rng = req.get("range", [0, 100])
             resolved = resolve_expansion(ref, rng, book)
-            log(f"[EXPAND actor] {ref} [{rng[0]}-{rng[1]}%] → {len(resolved)} chars")
+            log(f"[EXPAND actor] {ref} [{rng[0]}-{rng[1]}%] -> {len(resolved)} chars")
             pending_actor_expansions.append(resolved)
 
         if not chain_ok and "done" in response.get("actions", []):
@@ -410,7 +495,6 @@ def main() -> None:
         _rotate_history()
 
     logger.close()
-    probe_log.close()
 
 
 if __name__ == "__main__":
