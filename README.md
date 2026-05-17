@@ -57,7 +57,7 @@ clicked "Run Python File", and it worked. 4 cycles. No crash. Prompts got better
 
 ---
 
-## What it actually is (proven, not marketed)
+## What it actually is
 
 Endgame is a **closed-loop GUI agent** built on native Windows UI Automation. It:
 
@@ -93,7 +93,7 @@ graph TD
 
 ---
 
-## How to run (dead simple)
+## How to run
 
 1. Go to the repo → **Code → Download ZIP**
 2. Unzip anywhere
@@ -118,7 +118,7 @@ No virtualenv. No dependencies. Pure Python + Windows.
 
 ---
 
-## The seed effect (the coolest part)
+## The seed effect
 
 When you run Endgame with `--evolve`, it doesn't just complete the task — it **learns**.
 
